@@ -9,58 +9,69 @@ from rotary_position import RotaryPosition
 
 
 
-class TransformerDecoderBlock(torch.nn.Module):
-
-    def __init__(self, d_model, n_heads,rotary_emb,attention_type="Multi_Head_attention",\
-                 ffn_hidden_dim=4,llm_type="Autoregressive"):
+class TransformerBlock(torch.nn.Module):
+    """
+    Unified Transformer Block serving both:
+      - Decoder (Autoregressive): Causal masking enabled
+      - Encoder (Diffusion): Bidirectional full attention (no causal mask)
+    """
+    def __init__(
+        self, 
+        d_model, 
+        n_heads, 
+        rotary_emb, 
+        attention_type="Multi_Head_attention", 
+        ffn_hidden_dim=4,
+        llm_type="Autoregressive",
+        activation="relu"
+    ):
         super().__init__()
-        self.layerNorm1= torch.nn.LayerNorm(d_model)
-        if attention_type =="Multi_Head_attention":
-            self.attention=CustomMHA(d_model,n_heads,rotary_emb,llm_type)
-            print("Multi Head Attention")
-        elif attention_type =="Multi_Query_attention":
-            self.attention=CustomMQA(d_model,n_heads,rotary_emb,llm_type)
-            print("Multi Query Attention")
+        self.layerNorm1 = torch.nn.LayerNorm(d_model)
+        self.llm_type = llm_type
+        
+        # Dispatch Attention with llm_type
+        if attention_type == "Multi_Head_attention":
+            self.attention = CustomMHA(d_model, n_heads, rotary_emb, llm_type=llm_type)
+        elif attention_type == "Multi_Query_attention":
+            self.attention = CustomMQA(d_model, n_heads, rotary_emb, llm_type=llm_type)
         else:
-            print("Illegal Attention Type ",attention_type)
-            sys.exit(-1)
-        self.ffn_hidden_dim=ffn_hidden_dim
+            raise ValueError(f"Illegal Attention Type: {attention_type}")
+            
         self.layerNorm2 = torch.nn.LayerNorm(d_model)
-        print("FFN Hidden Dim ", ffn_hidden_dim)
-        self.FFN=torch.nn.Sequential(
+        self.ffn_hidden_dim = ffn_hidden_dim
+        
+        act_layer = torch.nn.GELU() if activation == "gelu" else torch.nn.ReLU()
+        self.FFN = torch.nn.Sequential(
             torch.nn.Linear(d_model, self.ffn_hidden_dim * d_model),
-            torch.nn.ReLU(),
+            act_layer,
             torch.nn.Linear(self.ffn_hidden_dim * d_model, d_model),
         )
-        self.dropout=torch.nn.Dropout(0.1)
+        self.dropout = torch.nn.Dropout(0.1)
 
-    '''
-        param x : (tensor) a tensor of size (batch_size, sequence_length, d_model)
-        returns the computed output of the block with the same size.
-    '''
     def forward(self, x):       
-        self.residual1=x
-        x=self.layerNorm1(x)
-        x=self.attention(x)
-        x1=x+self.residual1
+        # Pre-LN Self-Attention with residual connection
+        residual1 = x
+        x = self.layerNorm1(x)
+        x = self.attention(x)
+        x1 = x + residual1
 
-        self.residual2=x1
-        x1=self.layerNorm2(x1)
-        x1=self.FFN(x1)
-        x1=self.dropout(x1)
-        y=x1+self.residual2
+        # Pre-LN Feed-Forward with residual connection
+        residual2 = x1
+        x1 = self.layerNorm2(x1)
+        x1 = self.FFN(x1)
+        x1 = self.dropout(x1)
+        y = x1 + residual2
         return y
         
-        
 
-        
-        
-
-import sys
-import torch
+"""
+        GPT Model supporting Learned, Sinusoidal, or Rotary (RoPE) position embeddings.
+        Supports bidirectional attention when llm_type != "Autoregressive".
+        Also Supports Non Causal models
+        Supports Discrete Space Diffusion based models. Masked Based Diffusion models
+"""
 
 class GPTModel(torch.nn.Module):
-
     def __init__(
         self, 
         d_model, 
@@ -72,12 +83,12 @@ class GPTModel(torch.nn.Module):
         theta=10000.0,
         attention_type="Multi_Head_attention",
         ffn_hidden_dim=4,
-        llm_type="Autoregressive"
+        llm_type="Autoregressive",
+        activation="relu",
+        diffusion_steps=128
     ):
         """
-        GPT Model supporting Learned, Sinusoidal, or Rotary (RoPE) position embeddings.
-        Supports bidirectional attention when llm_type == "Diffusion".
-        Support Discrete Space Diffusion based models. Masked Based Diffusion models
+        Unified Model supporting both Autoregressive (Decoder) and Diffusion (Encoder) architectures.
         """
         super().__init__()
         self.d_model = d_model
@@ -88,6 +99,9 @@ class GPTModel(torch.nn.Module):
         self.positional_embedding = positional_embedding
         self.attention_type = attention_type
         self.theta = theta
+        self.llm_type = llm_type
+        self.activation=activation
+        self.diffusion_steps=diffusion_steps
         
         # Token Embedding
         self.embed1 = torch.nn.Embedding(vocab_size, d_model)
@@ -96,25 +110,29 @@ class GPTModel(torch.nn.Module):
         if positional_embedding == "learned":
             self.pos_emb = torch.nn.Embedding(max_seq_len, d_model)
             self.rotary_emb = None
-            print("Learned Embedding")
         elif positional_embedding == "sinusoidal":
             self.pos_emb = SinusoidalPosition(max_seq_len, d_model)
             self.pos_emb.requires_grad_(False)
             self.rotary_emb = None
-            print("Sinusoidal Embedding")
         elif positional_embedding == "rotary":
-            # Registered as a non-trainable buffer to move automatically with model.to(device)
             self.register_buffer("pos_emb", torch.zeros((max_seq_len, d_model)), persistent=False)
             self.rotary_emb = RotaryPosition(d_model, self.theta)
-            print("Rotary Embedding")
         else:
-            print("Illegal Embedding ", positional_embedding)
-            sys.exit(-1)
-        print("LLM TYPE: ",llm_type)
-        # Decoder Layers
+            raise ValueError(f"Illegal Embedding: {positional_embedding}")
+
+        if llm_type == "Diffusion":
+            self.time_emb = torch.nn.Embedding(self.diffusion_steps + 1, self.d_model)
+
+        # Transformer Blocks (Encoder vs Decoder dynamically selected via llm_type)
         self.transformer_layers = torch.nn.ModuleList([
-            TransformerDecoderBlock(
-                d_model, n_heads, self.rotary_emb, self.attention_type, ffn_hidden_dim
+            TransformerBlock(
+                d_model=d_model, 
+                n_heads=n_heads, 
+                rotary_emb=self.rotary_emb, 
+                attention_type=self.attention_type, 
+                ffn_hidden_dim=ffn_hidden_dim,
+                llm_type=self.llm_type,
+                activation=self.activation
             ) for _ in range(layers)
         ])
         
@@ -122,29 +140,19 @@ class GPTModel(torch.nn.Module):
         self.final_output = torch.nn.Linear(d_model, vocab_size)
 
     def forward(self, x):
-        # Batch size (B) and Sequence length (S)
         B, S = x.shape
-        
-        # Look up token embeddings: (B, S) -> (B, S, d_model)
         tokens = self.embed1(x)
         
         if self.positional_embedding != "rotary":
-            # Generate position indices on the SAME device as x
             positions = torch.arange(S, device=x.device)
-            
-            # Look up position embeddings and add to token embeddings
-            # (1, S, d_model) broadcasts seamlessly across batch dimension
             pos_embeddings = self.pos_emb(positions)
             X = tokens + pos_embeddings
         else:
-            # RoPE handles positional embeddings inside self-attention layers
             X = tokens
         
-        # Pass through transformer decoder blocks
         for layer in self.transformer_layers:
             X = layer(X)
             
-        # Project back to vocabulary logits: (B, S, d_model) -> (B, S, vocab_size)
         logits = self.final_output(X)
         return logits
         

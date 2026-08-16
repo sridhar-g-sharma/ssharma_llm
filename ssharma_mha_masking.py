@@ -15,6 +15,7 @@ class CustomMHA(torch.nn.Module):
     def __init__(self, d_model, n_heads, rotary_emb, RANDOM_WEIGHTS=True, llm_type="Autoregressive"):
         super().__init__()
         self.verbose = False
+        self.llm_type=llm_type
 
         if RANDOM_WEIGHTS:
             self.W_kqv = torch.nn.Parameter(0.01 * torch.rand(3 * d_model, d_model))
@@ -83,9 +84,6 @@ class CustomMHA(torch.nn.Module):
             QKT_masked = QKT.masked_fill(expanded_causal_mask, float("-inf"))
         else:
             QKT_masked = QKT
-
-        # Apply Causal Mask
-        QKT_masked = QKT.masked_fill(expanded_causal_mask, float("-inf"))
 
         # Softmax & Attention aggregation
         SQKT = torch.nn.functional.softmax(QKT_masked, dim=-1)

@@ -12,6 +12,7 @@ class CustomMQA(torch.nn.Module):
         self.embed_dim = d_model
         self.head_dim = d_model // n_heads
         self.rotary_emb = rotary_emb
+        self.llm_type = llm_type
 
         # Projections registered as Parameters
         self.query_proj = torch.nn.Parameter(0.01 * torch.rand(d_model, d_model))
@@ -54,7 +55,6 @@ class CustomMQA(torch.nn.Module):
         else:
             QKT_masked = QKT
         
-        QKT_masked = QKT.masked_fill(expanded_causal_mask, float('-inf'))
 
         # Softmax & Attention Value aggregation
         SQKT = torch.nn.functional.softmax(QKT_masked, dim=-1)
