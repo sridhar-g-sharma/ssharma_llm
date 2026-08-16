@@ -85,6 +85,7 @@ class GPTModel(torch.nn.Module):
         ffn_hidden_dim=4,
         llm_type="Autoregressive",
         activation="relu",
+        dropout=0.1,
         diffusion_steps=128
     ):
         """
@@ -135,11 +136,21 @@ class GPTModel(torch.nn.Module):
                 activation=self.activation
             ) for _ in range(layers)
         ])
+
+        # Final Output Layer Norm & Head
+        self.ln_f = torch.nn.LayerNorm(d_model)
+        self.final_output = torch.nn.Linear(d_model, vocab_size, bias=False)
+
+        # Tie token embedding and output head weights
+        self.final_output.weight = self.embed1.weight
+
+        # Embedding Dropout
+        self.drop = torch.nn.Dropout(dropout)
         
         # Final Output Head
         self.final_output = torch.nn.Linear(d_model, vocab_size)
 
-    def forward(self, x):
+    def forward(self, x, timesteps=None):
         B, S = x.shape
         tokens = self.embed1(x)
         
@@ -149,10 +160,21 @@ class GPTModel(torch.nn.Module):
             X = tokens + pos_embeddings
         else:
             X = tokens
+
+        X = self.drop(X)
+        # Add diffusion timesteps if applicable
+        if self.llm_type == "Diffusion":
+            if timesteps is None:
+                # Default to maximum timestep if not passed (e.g., standard inference)
+                timesteps = torch.full((B,), self.diffusion_steps, device=x.device, dtype=torch.long)
+            
+            t_emb = self.time_emb(timesteps).unsqueeze(1)  # [B, 1, D]
+            X = X + t_emb
         
         for layer in self.transformer_layers:
             X = layer(X)
-            
+
+        X = self.ln_f(X)   
         logits = self.final_output(X)
         return logits
         
